@@ -1,50 +1,80 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-# --------------------------------------------------
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
+
+
+# ==================================================
 # 기본 설정
-# --------------------------------------------------
+# ==================================================
+
 st.set_page_config(
-    page_title="기온 예측기",
+    page_title="기온 예측기 - 곡선 비교",
     page_icon="🌡️",
-    layout="wide",
+    layout="wide"
 )
 
 DATA_URL = (
     "https://raw.githubusercontent.com/greatsong/modudata/"
-    "bb860932644270ad1199f10d3e7670e30231bce4/data/seoul.csv"
+    "bb860932644270ad1199b10d3e7670e30231bce4/data/seoul.csv"
 )
 
-BASE_YEAR = 1908
-LAST_CLASS_YEAR = 2025
+LAST_YEAR = 2025
 MIN_OBSERVATION_DAYS = 300
 
+TRAIN_END = 2004
+TEST_START = 2005
 
-# --------------------------------------------------
+BASE_YEAR = 1908
+
+
+# ==================================================
 # 데이터 불러오기
-# --------------------------------------------------
+# ==================================================
+
 @st.cache_data
 def load_data():
-    df = pd.read_csv(DATA_URL, encoding="utf-8-sig")
 
-    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
-    df["평균기온"] = pd.to_numeric(df["평균기온"], errors="coerce")
+    df = pd.read_csv(
+        DATA_URL,
+        encoding="utf-8-sig"
+    )
 
-    df = df.dropna(subset=["날짜"])
+    # 날짜
+    df["날짜"] = pd.to_datetime(
+        df["날짜"],
+        errors="coerce"
+    )
+
+    # 평균기온 숫자 변환
+    df["평균기온"] = pd.to_numeric(
+        df["평균기온"],
+        errors="coerce"
+    )
+
+    df = df.dropna(
+        subset=["날짜", "평균기온"]
+    )
+
+    # 연도 추출
     df["연도"] = df["날짜"].dt.year
 
     # 2025년까지만 사용
-    df = df[df["연도"] <= LAST_CLASS_YEAR]
+    df = df[
+        df["연도"] <= LAST_YEAR
+    ]
 
-    # 연도별 평균기온과 관측일수
+    # 연도별 평균기온 + 관측일수
     annual = (
         df.groupby("연도")
         .agg(
             연평균기온=("평균기온", "mean"),
-            관측일수=("평균기온", "count"),
+            관측일수=("평균기온", "count")
         )
         .reset_index()
     )
@@ -54,223 +84,322 @@ def load_data():
         annual["관측일수"] >= MIN_OBSERVATION_DAYS
     ].copy()
 
-    annual = annual.dropna(subset=["연평균기온"])
+    annual = annual.sort_values("연도")
 
-    # 1908년부터 지난 연수
-    annual["1908년부터_지난_연수"] = (
-        annual["연도"] - BASE_YEAR
-    )
-
-    return annual
+    return annual.reset_index(drop=True)
 
 
 annual = load_data()
 
 
-# --------------------------------------------------
-# 전체 기간 회귀
-# --------------------------------------------------
-x_all = annual["1908년부터_지난_연수"].to_numpy()
-y_all = annual["연평균기온"].to_numpy()
+# ==================================================
+# 훈련 / 테스트 데이터 분리
+# ==================================================
 
-slope_all, intercept_all = np.polyfit(x_all, y_all, 1)
+train = annual[
+    annual["연도"] <= TRAIN_END
+].copy()
 
-annual["전체기간_회귀기온"] = (
-    slope_all * x_all + intercept_all
-)
-
-# 1년에 몇 도 상승 → 100년에 몇 도 상승
-slope_all_100 = slope_all * 100
+test = annual[
+    annual["연도"] >= TEST_START
+].copy()
 
 
-# --------------------------------------------------
-# 최근 20년 회귀
-# --------------------------------------------------
-recent_20 = annual.tail(20).copy()
+# ==================================================
+# 고차식 계산을 위한 연도 변환
+# ==================================================
+#
+# 실제 연도(1900, 2000 등)를 그대로 9차식에 넣으면
+# x^9의 숫자가 지나치게 커질 수 있다.
+#
+# 따라서 "기준 연도에서 몇 년 지났는가"로 바꾼다.
+#
+# 예:
+# 1908년 → 0
+# 1909년 → 1
+# 2005년 → 97
+# 2050년 → 142
+#
+# 그리고 PolynomialFeatures가 만드는 다항식에
+# StandardScaler를 사용하지 않고도 안정적으로 계산할 수
+# 있도록 x의 크기를 100년 기준으로 한 번 더 축소한다.
+# ==================================================
 
-x_recent = (
-    recent_20["연도"] - BASE_YEAR
-).to_numpy()
+scale = 100.0
 
-y_recent = recent_20["연평균기온"].to_numpy()
+train_x = (
+    (train["연도"] - BASE_YEAR) / scale
+).to_numpy().reshape(-1, 1)
 
-slope_recent, intercept_recent = np.polyfit(
-    x_recent,
-    y_recent,
-    1
-)
+train_y = train["연평균기온"].to_numpy()
 
-slope_recent_100 = slope_recent * 100
+test_x = (
+    (test["연도"] - BASE_YEAR) / scale
+).to_numpy().reshape(-1, 1)
 
-
-# --------------------------------------------------
-# 상관계수
-# --------------------------------------------------
-correlation = annual["연도"].corr(
-    annual["연평균기온"]
-)
-
-
-# --------------------------------------------------
-# 기간 정보
-# --------------------------------------------------
-start_year = int(annual["연도"].min())
-end_year = int(annual["연도"].max())
-year_count = len(annual)
-
-recent_start_year = int(recent_20["연도"].min())
-recent_end_year = int(recent_20["연도"].max())
+test_y = test["연평균기온"].to_numpy()
 
 
-# --------------------------------------------------
+# ==================================================
+# 다항회귀 모델 만들기
+# ==================================================
+
+def make_polynomial_model(degree):
+
+    return make_pipeline(
+        PolynomialFeatures(
+            degree=degree,
+            include_bias=False
+        ),
+        LinearRegression()
+    )
+
+
+models = {}
+
+predictions = {}
+
+results = []
+
+
+# ==================================================
+# 1차 / 3차 / 9차 모델 학습 및 테스트
+# ==================================================
+
+for degree in [1, 3, 9]:
+
+    model = make_polynomial_model(degree)
+
+    # 반드시 훈련 데이터만으로 학습
+    model.fit(
+        train_x,
+        train_y
+    )
+
+    # 테스트 데이터 예측
+    test_pred = model.predict(
+        test_x
+    )
+
+    # 테스트 데이터 MAE
+    mae = mean_absolute_error(
+        test_y,
+        test_pred
+    )
+
+    # 2050년 예측
+    x_2050 = np.array(
+        [[
+            (2050 - BASE_YEAR) / scale
+        ]]
+    )
+
+    prediction_2050 = float(
+        model.predict(x_2050)[0]
+    )
+
+    models[degree] = model
+    predictions[degree] = test_pred
+
+    results.append(
+        {
+            "모델": f"{degree}차",
+            "테스트 평균 오차 (MAE, ℃)": mae,
+            "2050년 예상 연평균기온 (℃)": prediction_2050
+        }
+    )
+
+
+results_df = pd.DataFrame(results)
+
+
+# ==================================================
 # 화면
-# --------------------------------------------------
-st.title("🌡️ 기온 예측기")
+# ==================================================
+
+st.title("🌡️ 기온 예측기 — 직선과 곡선 비교")
 
 st.write(
-    "서울의 연도별 평균기온을 이용해 기온 변화 추세를 살펴보고, "
-    "선형 회귀로 선택한 연도의 예상 평균기온을 계산합니다."
+    "과거 서울의 연평균기온을 이용해 1차, 3차, 9차 "
+    "다항회귀 모델을 학습하고, 학습에 사용하지 않은 "
+    "테스트 데이터로 예측 성능을 비교합니다."
 )
 
 
-# --------------------------------------------------
-# 전체 기간 / 최근 20년 기울기 비교
-# --------------------------------------------------
-st.subheader("📈 100년에 몇 ℃ 오르는가?")
+# ==================================================
+# 데이터 분할 표시
+# ==================================================
+
+st.subheader("📚 훈련 데이터와 테스트 데이터")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("### 전체 기간")
+
+    st.markdown("### 🧑‍🏫 훈련 데이터")
+
     st.metric(
-        f"{start_year}~{end_year}",
-        f"{slope_all_100:+.2f} ℃ / 100년"
+        "연도 수",
+        f"{len(train)}개"
     )
-    st.caption(
-        f"{year_count}개 연도의 자료로 계산"
+
+    st.write(
+        f"사용 기간: "
+        f"**{int(train['연도'].min())}~"
+        f"{int(train['연도'].max())}년**"
     )
 
 with col2:
-    st.markdown("### 최근 20년")
+
+    st.markdown("### 📝 테스트 데이터")
+
     st.metric(
-        f"{recent_start_year}~{recent_end_year}",
-        f"{slope_recent_100:+.2f} ℃ / 100년"
-    )
-    st.caption(
-        "최근 20개 연도의 자료로 계산"
+        "연도 수",
+        f"{len(test)}개"
     )
 
+    st.write(
+        f"사용 기간: "
+        f"**{int(test['연도'].min())}~"
+        f"{int(test['연도'].max())}년**"
+    )
 
-# --------------------------------------------------
-# 추가 분석 정보
-# --------------------------------------------------
-st.subheader("📊 분석에 사용한 기간")
-
-info1, info2, info3, info4 = st.columns(4)
-
-info1.metric(
-    "전체 연도 수",
-    f"{year_count}개"
+st.info(
+    "중요: 테스트 데이터는 1차·3차·9차 모델의 학습에 "
+    "전혀 사용하지 않았습니다. 모델을 학습한 뒤 "
+    "테스트 데이터에 처음 적용하여 성능을 평가합니다."
 )
 
-info2.metric(
-    "시작 연도",
-    f"{start_year}년"
+
+# ==================================================
+# 핵심 결과 표
+# ==================================================
+
+st.subheader("📊 모델별 예측 결과")
+
+display_df = results_df.copy()
+
+display_df[
+    "테스트 평균 오차 (MAE, ℃)"
+] = display_df[
+    "테스트 평균 오차 (MAE, ℃)"
+].map(
+    lambda x: f"{x:.3f}"
 )
 
-info3.metric(
-    "끝 연도",
-    f"{end_year}년"
+display_df[
+    "2050년 예상 연평균기온 (℃)"
+] = display_df[
+    "2050년 예상 연평균기온 (℃)"
+].map(
+    lambda x: f"{x:.2f}"
 )
 
-info4.metric(
-    "전체 상관계수",
-    f"{correlation:.3f}"
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True
 )
 
 st.caption(
-    f"2025년 이후 데이터와 관측일이 "
-    f"{MIN_OBSERVATION_DAYS}일 미만인 해는 제외했습니다."
+    "MAE는 테스트 기간 동안 실제 기온과 예측 기온의 "
+    "평균적인 차이입니다. 작을수록 예측이 좋습니다."
 )
 
 
-# --------------------------------------------------
-# 산점도 + 두 개의 회귀 직선
-# --------------------------------------------------
-st.subheader("📉 연도별 평균기온과 회귀 직선")
+# ==================================================
+# 가장 좋은 모델 표시
+# ==================================================
+
+best_row = results_df.loc[
+    results_df[
+        "테스트 평균 오차 (MAE, ℃)"
+    ].idxmin()
+]
+
+best_model_name = best_row["모델"]
+best_mae = best_row[
+    "테스트 평균 오차 (MAE, ℃)"
+]
+
+st.success(
+    f"테스트 데이터에서 평균 오차가 가장 작은 모델은 "
+    f"**{best_model_name}**이며, "
+    f"평균적으로 약 **{best_mae:.2f}℃** 차이가 났습니다."
+)
+
+
+# ==================================================
+# 테스트 데이터에서 실제값과 예측값 비교
+# ==================================================
+
+st.subheader(
+    "📈 테스트 기간 실제 기온 vs 모델 예측"
+)
 
 fig = go.Figure()
 
-# 실제 연평균기온 산점도
+
+# 실제 기온
 fig.add_trace(
     go.Scatter(
-        x=annual["연도"],
-        y=annual["연평균기온"],
-        mode="markers",
-        name="연평균기온",
-        customdata=annual["관측일수"],
+        x=test["연도"],
+        y=test["연평균기온"],
+        mode="lines+markers",
+        name="실제 연평균기온",
         hovertemplate=(
             "<b>%{x}년</b><br>"
-            "평균기온: %{y:.2f} ℃<br>"
-            "관측일수: %{customdata}일"
+            "실제 기온: %{y:.2f} ℃"
             "<extra></extra>"
-        ),
+        )
     )
 )
 
 
-# 전체 기간 회귀선
-line_years_all = np.arange(
-    start_year,
-    end_year + 1
-)
-
-line_x_all = line_years_all - BASE_YEAR
-
-line_temperature_all = (
-    slope_all * line_x_all
-    + intercept_all
-)
-
+# 1차
 fig.add_trace(
     go.Scatter(
-        x=line_years_all,
-        y=line_temperature_all,
+        x=test["연도"],
+        y=predictions[1],
         mode="lines",
-        name="전체 기간 회귀선",
+        name="1차 모델",
         hovertemplate=(
             "<b>%{x}년</b><br>"
-            "회귀선: %{y:.2f} ℃"
+            "1차 예측: %{y:.2f} ℃"
             "<extra></extra>"
-        ),
+        )
     )
 )
 
 
-# 최근 20년 회귀선
-line_years_recent = np.arange(
-    recent_start_year,
-    recent_end_year + 1
-)
-
-line_x_recent = line_years_recent - BASE_YEAR
-
-line_temperature_recent = (
-    slope_recent * line_x_recent
-    + intercept_recent
-)
-
+# 3차
 fig.add_trace(
     go.Scatter(
-        x=line_years_recent,
-        y=line_temperature_recent,
+        x=test["연도"],
+        y=predictions[3],
         mode="lines",
-        name="최근 20년 회귀선",
+        name="3차 모델",
         hovertemplate=(
             "<b>%{x}년</b><br>"
-            "최근 20년 회귀선: %{y:.2f} ℃"
+            "3차 예측: %{y:.2f} ℃"
             "<extra></extra>"
-        ),
+        )
+    )
+)
+
+
+# 9차
+fig.add_trace(
+    go.Scatter(
+        x=test["연도"],
+        y=predictions[9],
+        mode="lines",
+        name="9차 모델",
+        hovertemplate=(
+            "<b>%{x}년</b><br>"
+            "9차 예측: %{y:.2f} ℃"
+            "<extra></extra>"
+        )
     )
 )
 
@@ -278,17 +407,12 @@ fig.add_trace(
 fig.update_layout(
     xaxis_title="연도",
     yaxis_title="연평균기온 (℃)",
-    hovermode="closest",
-    legend_title="데이터",
+    hovermode="x unified",
+    legend_title="데이터"
 )
 
-# 가로축에는 실제 연도 표시
 fig.update_xaxes(
-    tickformat="d",
-    range=[
-        start_year - 2,
-        end_year + 2
-    ],
+    tickformat="d"
 )
 
 st.plotly_chart(
@@ -297,92 +421,143 @@ st.plotly_chart(
 )
 
 
-# --------------------------------------------------
-# 회귀식
-# --------------------------------------------------
-st.subheader("🧮 회귀 분석")
+# ==================================================
+# 전체 기간에 대한 학습 곡선 시각화
+# ==================================================
 
-reg1, reg2 = st.columns(2)
-
-with reg1:
-    st.markdown("### 전체 기간")
-    st.write(
-        f"**100년당 변화량:** "
-        f"{slope_all_100:+.2f} ℃"
-    )
-    st.write(
-        f"**회귀식:** "
-        f"예상 기온 = "
-        f"{slope_all:.5f} × (연도 - {BASE_YEAR}) "
-        f"{intercept_all:+.3f}"
-    )
-
-with reg2:
-    st.markdown("### 최근 20년")
-    st.write(
-        f"**100년당 변화량:** "
-        f"{slope_recent_100:+.2f} ℃"
-    )
-    st.write(
-        f"**회귀식:** "
-        f"예상 기온 = "
-        f"{slope_recent:.5f} × (연도 - {BASE_YEAR}) "
-        f"{intercept_recent:+.3f}"
-    )
-
-
-# --------------------------------------------------
-# 연도 선택 및 예상 기온
-# --------------------------------------------------
-st.subheader("🔮 연도별 기온 예측")
-
-selected_year = st.slider(
-    "예측할 연도를 선택하세요.",
-    min_value=1900,
-    max_value=2100,
-    value=2025,
-    step=1,
+st.subheader(
+    "📉 훈련 데이터에서 만든 세 가지 회귀곡선"
 )
 
-selected_x = selected_year - BASE_YEAR
-
-predicted_temperature = (
-    slope_all * selected_x
-    + intercept_all
+plot_years = np.arange(
+    int(annual["연도"].min()),
+    2051
 )
+
+plot_x = (
+    (plot_years - BASE_YEAR) / scale
+).reshape(-1, 1)
+
+fig2 = go.Figure()
+
+
+# 실제 데이터
+fig2.add_trace(
+    go.Scatter(
+        x=annual["연도"],
+        y=annual["연평균기온"],
+        mode="markers",
+        name="실제 연평균기온",
+        marker=dict(
+            size=6
+        ),
+        hovertemplate=(
+            "<b>%{x}년</b><br>"
+            "평균기온: %{y:.2f} ℃"
+            "<extra></extra>"
+        )
+    )
+)
+
+
+# 훈련 / 테스트 경계 표시
+fig2.add_vline(
+    x=TEST_START,
+    line_dash="dash",
+    annotation_text="훈련 → 테스트",
+    annotation_position="top"
+)
+
+
+for degree in [1, 3, 9]:
+
+    curve = models[degree].predict(
+        plot_x
+    )
+
+    fig2.add_trace(
+        go.Scatter(
+            x=plot_years,
+            y=curve,
+            mode="lines",
+            name=f"{degree}차 회귀곡선",
+            hovertemplate=(
+                "<b>%{x}년</b><br>"
+                f"{degree}차 예측: "
+                "%{y:.2f} ℃"
+                "<extra></extra>"
+            )
+        )
+    )
+
+
+fig2.update_layout(
+    xaxis_title="연도",
+    yaxis_title="연평균기온 (℃)",
+    hovermode="closest",
+    legend_title="모델"
+)
+
+fig2.update_xaxes(
+    tickformat="d"
+)
+
+st.plotly_chart(
+    fig2,
+    use_container_width=True
+)
+
+
+# ==================================================
+# 2050년 예측 비교
+# ==================================================
+
+st.subheader("🔮 2050년 예측 비교")
+
+c1, c2, c3 = st.columns(3)
+
+for col, degree in zip(
+    [c1, c2, c3],
+    [1, 3, 9]
+):
+
+    prediction = results_df.loc[
+        results_df["모델"] == f"{degree}차",
+        "2050년 예상 연평균기온 (℃)"
+    ].iloc[0]
+
+    with col:
+
+        st.markdown(
+            f"### {degree}차 모델"
+        )
+
+        st.metric(
+            "2050년 예상 기온",
+            f"{prediction:.2f} ℃"
+        )
+
+
+# ==================================================
+# 해석
+# ==================================================
+
+st.subheader("💡 어떻게 비교하면 될까?")
 
 st.markdown(
-    f"""
-    <div style="
-        text-align: center;
-        padding: 30px;
-        border-radius: 15px;
-        background-color: rgba(128, 128, 128, 0.12);
-        margin-top: 15px;
-        margin-bottom: 20px;
-    ">
-        <div style="font-size: 24px;">
-            {selected_year}년 예상 연평균기온
-        </div>
-        <div style="
-            font-size: 60px;
-            font-weight: bold;
-            margin-top: 5px;
-        ">
-            {predicted_temperature:.2f} ℃
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+    """
+- **MAE가 작은 모델**: 테스트 기간의 실제 기온을 평균적으로 더 가깝게 예측한 모델입니다.
+- **1차 모델**: 변화 추세를 하나의 직선으로 표현합니다.
+- **3차 모델**: 기온 변화가 한 번 휘어지는 정도까지 표현할 수 있습니다.
+- **9차 모델**: 과거 데이터의 복잡한 굴곡을 훨씬 자유롭게 따라갈 수 있습니다.
+- 하지만 **차수가 높다고 반드시 미래 예측을 더 잘하는 것은 아닙니다.**
+  특히 9차 모델은 훈련 데이터에 지나치게 맞춰질 가능성이 있기 때문에
+  이번처럼 **학습에 사용하지 않은 테스트 데이터의 MAE로 평가하는 것**이 중요합니다.
+"""
 )
 
-if selected_year < start_year or selected_year > end_year:
-    st.warning(
-        f"{selected_year}년은 회귀 직선을 만든 관측 기간 "
-        f"({start_year}~{end_year}년) 밖의 값입니다. "
-        "따라서 회귀선을 연장한 추정값입니다."
-    )
-
 st.caption(
-    "예상 기온은 과거 연평균기온의 선형 추세를 이용한 단순 추정값입니다."
+    "9차 회귀에서는 연도 자체를 그대로 사용하지 않고 "
+    "1908년을 기준으로 한 경과 연수를 100으로 나눈 값을 사용해 "
+    "고차식 계산에서 발생할 수 있는 수치적인 불안정을 줄였습니다."
 )
